@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"log"
-	"net/http"
+	"github.com/nourbol/greenlight/internal/data"
+	"github.com/nourbol/greenlight/internal/jsonlog"
+	"github.com/nourbol/greenlight/internal/mailer"
 	"os"
 	"time"
 )
@@ -21,11 +21,25 @@ type config struct {
 		maxConns    int
 		maxIdleTime string
 	}
+	limiter struct {
+		rps     float64
+		burst   int
+		enabled bool
+	}
+	smtp struct {
+		host     string
+		port     int
+		username string
+		password string
+		sender   string
+	}
 }
 
 type application struct {
 	config config
-	logger *log.Logger
+	logger *jsonlog.Logger
+	models data.Models
+	mailer mailer.Mailer
 }
 
 func main() {
@@ -33,50 +47,49 @@ func main() {
 
 	flag.IntVar(&cfg.port, "port", 4000, "API server port")
 	flag.StringVar(&cfg.env, "env", "development", "Environment (development|staging|production)")
-	flag.StringVar(&cfg.db.dsn, "db-dsn", "postgres://greenlight:pa55word@localhost/greenlight?sslmode=disable", "PostgreSQL DSN")
+	flag.StringVar(&cfg.db.dsn, "db-dsn", os.Getenv("GREENLIGHT_DB_DSN"), "PostgreSQL DSN")
 	flag.IntVar(&cfg.db.maxConns, "db-max-open-conns", 25, "PostgreSQL max open connections")
 	flag.StringVar(&cfg.db.maxIdleTime, "db-max-idle-time", "15m", "PostgreSQL max connection idle time")
 
+	flag.Float64Var(&cfg.limiter.rps, "limiter-rps", 2, "Rate limiter maximum requests per second")
+	flag.IntVar(&cfg.limiter.burst, "limiter-burst", 4, "Rate limiter maximum burst")
+	flag.BoolVar(&cfg.limiter.enabled, "limiter-enabled", true, "Enable rate limiter")
+
+	flag.StringVar(&cfg.smtp.host, "smtp-host", "smtp-mail.outlook.com", "SMTP host")
+	flag.IntVar(&cfg.smtp.port, "smtp-port", 587, "SMTP port")
+	flag.StringVar(&cfg.smtp.username, "smtp-username", "211477@astanait.edu.kz", "SMTP username")
+	flag.StringVar(&cfg.smtp.password, "smtp-password", os.Getenv("GREENLIGHT_SMTP_PASSWORD"), "SMTP password")
+	flag.StringVar(&cfg.smtp.sender, "smtp-sender", "Greenlight <211751@astanait.edu.kz>", "SMTP sender")
+
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "", log.Ldate|log.Ltime)
+	logger := jsonlog.New(os.Stdout, jsonlog.LevelInfo)
 
 	db, err := openDB(cfg)
 	if err != nil {
-		logger.Fatal(err)
+		logger.PrintFatal(err, nil)
 	}
 	defer db.Close()
-	logger.Printf("database connection pool established")
+	logger.PrintInfo("database connection pool established", nil)
 
 	app := &application{
 		config: cfg,
 		logger: logger,
+		models: data.NewModels(db),
+		mailer: mailer.New(cfg.smtp.host, cfg.smtp.port, cfg.smtp.username, cfg.smtp.password, cfg.smtp.sender),
 	}
 
-	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.port),
-		Handler:      app.routes(),
-		IdleTimeout:  time.Minute,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+	err = app.serve()
+	if err != nil {
+		logger.PrintFatal(err, nil)
 	}
-
-	logger.Printf("starting %s server on %s", cfg.env, srv.Addr)
-	err = srv.ListenAndServe()
-	logger.Fatal(err)
 }
 
 func openDB(cfg config) (*pgxpool.Pool, error) {
-	poolCfg, err := pgxpool.ParseConfig(cfg.db.dsn)
+	poolCfg, err := configurePool(cfg)
 	if err != nil {
 		return nil, err
 	}
-	poolCfg.MaxConns = int32(cfg.db.maxConns)
-	duration, err := time.ParseDuration(cfg.db.maxIdleTime)
-	if err != nil {
-		return nil, err
-	}
-	poolCfg.MaxConnIdleTime = duration
 
 	conn, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
@@ -91,4 +104,18 @@ func openDB(cfg config) (*pgxpool.Pool, error) {
 	}
 
 	return conn, nil
+}
+
+func configurePool(cfg config) (*pgxpool.Config, error) {
+	poolCfg, err := pgxpool.ParseConfig(cfg.db.dsn)
+	if err != nil {
+		return nil, err
+	}
+	poolCfg.MaxConns = int32(cfg.db.maxConns)
+	duration, err := time.ParseDuration(cfg.db.maxIdleTime)
+	if err != nil {
+		return nil, err
+	}
+	poolCfg.MaxConnIdleTime = duration
+	return poolCfg, nil
 }
